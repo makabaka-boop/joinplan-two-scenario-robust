@@ -123,6 +123,79 @@ def brute_best(names, rows, predicates):
     return min(candidates)
 
 
+def brute_best_two(names, rows, predicates, alternatives):
+    """Exhaustive dual-objective optimum, retaining every legal tree."""
+    n = len(names)
+    index = {name: i for i, name in enumerate(names)}
+    selectivities = [
+        [[Fraction(1)] * n for _ in range(n)]
+        for _ in range(2)
+    ]
+    adjacent = [[False] * n for _ in range(n)]
+    for k, (left, right, primary) in enumerate(predicates):
+        i, j = index[left], index[right]
+        values = (primary, alternatives[k])
+        for scenario, value in enumerate(values):
+            selectivities[scenario][i][j] *= value
+            selectivities[scenario][j][i] *= value
+        adjacent[i][j] = adjacent[j][i] = True
+
+    size = 1 << n
+    rows_of = [None] * size
+    for mask in range(1, size):
+        estimate = [Fraction(1), Fraction(1)]
+        for i in range(n):
+            if mask >> i & 1:
+                estimate[0] *= rows[names[i]]
+                estimate[1] *= rows[names[i]]
+        for scenario in range(2):
+            for i in range(n):
+                for j in range(i + 1, n):
+                    if mask >> i & 1 and mask >> j & 1:
+                        estimate[scenario] *= selectivities[scenario][i][j]
+        rows_of[mask] = (estimate[0], estimate[1])
+
+    def has_edge(sub, other):
+        for i in range(n):
+            if not (sub >> i & 1):
+                continue
+            for j in range(n):
+                if other >> j & 1 and adjacent[i][j]:
+                    return True
+        return False
+
+    @lru_cache(maxsize=None)
+    def all_trees(mask):
+        if mask & (mask - 1) == 0:
+            i = (mask & -mask).bit_length() - 1
+            return (((Fraction(0), Fraction(0)), names[i]),)
+        out = []
+        low = mask & -mask
+        sub = (mask - 1) & mask
+        while sub:
+            other = mask ^ sub
+            if sub & low and other and has_edge(sub, other):
+                for left_cost, left_str in all_trees(sub):
+                    for right_cost, right_str in all_trees(other):
+                        root_rows = rows_of[mask]
+                        out.append(
+                            (
+                                (
+                                    left_cost[0] + right_cost[0] + root_rows[0],
+                                    left_cost[1] + right_cost[1] + root_rows[1],
+                                ),
+                                fuse(left_str, right_str),
+                            )
+                        )
+            sub = (sub - 1) & mask
+        return tuple(out)
+
+    candidates = all_trees(size - 1)
+    if not candidates:
+        return None
+    return min(candidates, key=lambda item: (max(item[0]), sum(item[0]), item[1]))
+
+
 # ---------------------------------------------------------------------------
 # structural validation of the planner's tree
 # ---------------------------------------------------------------------------
@@ -185,6 +258,107 @@ def walk_tree(node, rows, predicates):
     return tables, canonical, left_cost + right_cost + expected, left_used + right_used + cross
 
 
+def walk_tree_two(node, rows, predicates, alternatives):
+    """Validate a two-distribution tree and return its independent costs."""
+    if node["type"] == "table":
+        assert set(node) == {"type", "name", "rows"}
+        assert node["rows"] == rows[node["name"]]
+        return {node["name"]}, node["name"], (Fraction(0), Fraction(0)), []
+
+    assert node["type"] == "join"
+    assert set(node) == {
+        "type",
+        "rows",
+        "alternative_rows",
+        "tables",
+        "predicates",
+        "children",
+    }
+    assert len(node["children"]) == 2
+    left_tables, left_str, left_cost, left_used = walk_tree_two(
+        node["children"][0], rows, predicates, alternatives
+    )
+    right_tables, right_str, right_cost, right_used = walk_tree_two(
+        node["children"][1], rows, predicates, alternatives
+    )
+    assert left_str <= right_str
+    assert left_tables.isdisjoint(right_tables)
+    tables = left_tables | right_tables
+    assert node["tables"] == sorted(tables)
+
+    expected = [Fraction(1), Fraction(1)]
+    for name in tables:
+        expected[0] *= rows[name]
+        expected[1] *= rows[name]
+    for k, (left, right, sel) in enumerate(predicates):
+        if left in tables and right in tables:
+            expected[0] *= sel
+            expected[1] *= alternatives[k]
+    assert parse_frac(node["rows"]) == expected[0]
+    assert parse_frac(node["alternative_rows"]) == expected[1]
+
+    cross = [
+        k
+        for k, (left, right, _) in enumerate(predicates)
+        if (left in left_tables and right in right_tables)
+        or (left in right_tables and right in left_tables)
+    ]
+    assert cross, "every merge must have at least one predicate across the cut"
+    listed = [
+        {
+            "left": predicates[k][0],
+            "right": predicates[k][1],
+            "selectivity": format_fraction(predicates[k][2]),
+            "alternative_selectivity": format_fraction(alternatives[k]),
+        }
+        for k in cross
+    ]
+    assert node["predicates"] == listed
+
+    canonical = "(" + left_str + right_str + ")"
+    costs = (
+        left_cost[0] + right_cost[0] + expected[0],
+        left_cost[1] + right_cost[1] + expected[1],
+    )
+    return tables, canonical, costs, left_used + right_used + cross
+
+
+def check_two_result(result, names, rows, predicates, alternatives):
+    """Cross-check every connected component against dual brute force."""
+    components = components_of(names, predicates)
+    if len(components) == 1:
+        assert result["status"] == "ok"
+        entries = [(tuple(components[0]), result)]
+    else:
+        assert result["status"] == "disconnected"
+        by_tables = {tuple(c["tables"]): c for c in result["components"]}
+        entries = [(tuple(sorted(c)), by_tables[tuple(sorted(c))]) for c in components]
+
+    for key, entry in entries:
+        tables = list(key)
+        members = set(tables)
+        local_indexes = [
+            i for i, predicate in enumerate(predicates) if predicate[0] in members
+        ]
+        local = [predicates[i] for i in local_indexes]
+        local_alt = [alternatives[i] for i in local_indexes]
+        if len(tables) == 1:
+            assert entry["cost"] == "0/1"
+            assert entry["alternative_cost"] == "0/1"
+            assert entry["tree_string"] == tables[0]
+            continue
+        best_cost, canonical = brute_best_two(tables, rows, local, local_alt)
+        assert (parse_frac(entry["cost"]), parse_frac(entry["alternative_cost"])) == best_cost
+        assert entry["tree_string"] == canonical
+        got_tables, got_str, got_cost, used = walk_tree_two(
+            entry["tree"], rows, local, local_alt
+        )
+        assert got_tables == members
+        assert got_str == canonical
+        assert got_cost == best_cost
+        assert sorted(used) == list(range(len(local)))
+
+
 def check_whole_result(result, names, rows, predicates):
     """Cross-check a planner result against brute force and structure."""
     components = components_of(names, predicates)
@@ -236,6 +410,102 @@ def make_payload(names, rows, predicates):
             for left, right, sel in predicates
         ],
     }
+
+
+def make_two_payload(names, rows, predicates, alternatives):
+    payload = make_payload(names, rows, predicates)
+    payload["alternative_selectivities"] = [
+        format_fraction(value) for value in alternatives
+    ]
+    return payload
+
+
+# ---------------------------------------------------------------------------
+# deterministic two-distribution cases
+# ---------------------------------------------------------------------------
+
+
+def test_two_distributions_compromise_tree_can_be_neither_single_winner():
+    names = ["A", "B", "C", "D"]
+    rows = {name: 1000 for name in names}
+    predicates = [
+        ("A", "B", Fraction(1, 100)),
+        ("B", "C", Fraction(1, 50)),
+        ("C", "D", Fraction(1, 4)),
+    ]
+    alternatives = [Fraction(1, 2), Fraction(1, 100), Fraction(1, 100)]
+    result = solve(make_two_payload(names, rows, predicates, alternatives))
+    assert result["status"] == "ok"
+    assert result["cost"] == "50260000/1"
+    assert result["alternative_cost"] == "50510000/1"
+    assert result["tree_string"] == "((AB)(CD))"
+    root = result["tree"]
+    assert root["rows"] == "50000000/1"
+    assert root["alternative_rows"] == "50000000/1"
+    check_two_result(result, names, rows, predicates, alternatives)
+
+
+def test_two_distributions_lexicographic_objective():
+    payload = {
+        "tables": [
+            {"name": "A", "rows": 100},
+            {"name": "B", "rows": 100},
+            {"name": "C", "rows": 100},
+        ],
+        "predicates": [
+            {"left": "A", "right": "B", "selectivity": "1/2"},
+            {"left": "B", "right": "C", "selectivity": "1/8"},
+        ],
+        "alternative_selectivities": ["1/8", "1/2"],
+    }
+    result = solve(payload)
+    # AB plan: (67500, 63750); BC plan: (63750, 67500).  Both maxima and
+    # sums tie.
+    assert result["cost"] == "67500/1"
+    assert result["alternative_cost"] == "63750/1"
+    assert result["tree_string"] == "((AB)C)"
+
+
+def test_two_distributions_sum_breaks_max_tie():
+    # (((AB)C)D) and ((AB)(CD)) have the same worst-case cost (436/25).  The
+    # first has a smaller sum, even though ((AB)(CD)) has the smaller tree
+    # string; therefore sum must decide before tree-string tie-breaking.
+    payload = {
+        "tables": [
+            {"name": "A", "rows": 10},
+            {"name": "B", "rows": 8},
+            {"name": "C", "rows": 11},
+            {"name": "D", "rows": 4},
+        ],
+        "predicates": [
+            {"left": "A", "right": "B", "selectivity": "1/40"},
+            {"left": "B", "right": "C", "selectivity": "1/50"},
+            {"left": "C", "right": "D", "selectivity": "1/50"},
+        ],
+        "alternative_selectivities": ["1/50", "1/2", "1/5"],
+    }
+    result = solve(payload)
+    assert result["cost"] == "1547/625"
+    assert result["alternative_cost"] == "436/25"
+    assert result["tree_string"] == "(((AB)C)D)"
+
+
+def test_two_distributions_disconnected_components():
+    names = ["A", "B", "C", "D"]
+    rows = {"A": 10, "B": 20, "C": 30, "D": 40}
+    predicates = [
+        ("A", "B", Fraction(1, 2)),
+        ("C", "D", Fraction(1, 4)),
+    ]
+    alternatives = [Fraction(1, 5), Fraction(1, 3)]
+    result = solve(make_two_payload(names, rows, predicates, alternatives))
+    assert result["status"] == "disconnected"
+    components = {tuple(c["tables"]): c for c in result["components"]}
+    assert components[("A", "B")]["cost"] == "100/1"
+    assert components[("A", "B")]["alternative_cost"] == "40/1"
+    assert components[("C", "D")]["cost"] == "300/1"
+    assert components[("C", "D")]["alternative_cost"] == "400/1"
+    check_two_result(result, names, rows, predicates, alternatives)
 
 
 # ---------------------------------------------------------------------------
@@ -460,6 +730,22 @@ def test_random_connected_dense(seed):
     check_whole_result(result, names, rows, predicates)
 
 
+@pytest.mark.parametrize("seed", range(120))
+def test_random_two_distributions_against_brute_force(seed):
+    rng = random.Random(20_000 + seed)
+    pool = PREFIX_NAMES if seed % 4 == 0 else SAFE_NAMES
+    n = rng.randint(2, 6)
+    names = rng.sample(pool, n)
+    rows = {name: rng.randint(1, 10**3) for name in names}
+    predicates = []
+    for _ in range(rng.randint(n - 1, 2 * n + 2)):
+        left, right = rng.sample(names, 2)
+        predicates.append((left, right, rng.choice(SELECTIVITIES)))
+    alternatives = [rng.choice(SELECTIVITIES) for _ in predicates]
+    result = solve(make_two_payload(names, rows, predicates, alternatives))
+    check_two_result(result, names, rows, predicates, alternatives)
+
+
 # ---------------------------------------------------------------------------
 # input validation
 # ---------------------------------------------------------------------------
@@ -546,6 +832,37 @@ BAD_PAYLOADS = {
         "tables": [{"name": "A", "rows": 1}, {"name": "B", "rows": 1}],
         "predicates": {},
     },
+    "alternative too many tables": {
+        "tables": [{"name": f"T{i}", "rows": 1} for i in range(7)],
+        "predicates": [],
+        "alternative_selectivities": [],
+    },
+    "alternative not a list": {
+        "tables": [{"name": "A", "rows": 1}, {"name": "B", "rows": 1}],
+        "predicates": [],
+        "alternative_selectivities": {},
+    },
+    "alternative wrong length": {
+        "tables": [{"name": "A", "rows": 1}, {"name": "B", "rows": 1}],
+        "predicates": [{"left": "A", "right": "B", "selectivity": "1/2"}],
+        "alternative_selectivities": ["1/2", "1/3"],
+    },
+    "alternative invalid fraction": {
+        "tables": [{"name": "A", "rows": 1}, {"name": "B", "rows": 1}],
+        "predicates": [{"left": "A", "right": "B", "selectivity": "1/2"}],
+        "alternative_selectivities": ["2/0"],
+    },
+    "alternative above one": {
+        "tables": [{"name": "A", "rows": 1}, {"name": "B", "rows": 1}],
+        "predicates": [{"left": "A", "right": "B", "selectivity": "1/2"}],
+        "alternative_selectivities": [3],
+    },
+    "two alternative keys": {
+        "tables": [{"name": "A", "rows": 1}, {"name": "B", "rows": 1}],
+        "predicates": [],
+        "alternative_selectivities": [],
+        "alt_selectivities": [],
+    },
 }
 
 
@@ -563,6 +880,50 @@ def test_non_reduced_selectivity_is_accepted_and_reduced():
     result = solve(payload)
     assert result["cost"] == "50/1"
     assert result["tree"]["predicates"][0]["selectivity"] == "1/2"
+
+
+def test_without_alternative_input_and_output_remain_compatible():
+    payload = {
+        "tables": [{"name": "A", "rows": 10}, {"name": "B", "rows": 10}],
+        "predicates": [{"left": "A", "right": "B", "selectivity": "1/2"}],
+    }
+    result = solve(payload)
+    assert set(result) == {"status", "cost", "tree_string", "tree"}
+    assert "alternative_cost" not in result
+    assert set(result["tree"]) == {
+        "type",
+        "rows",
+        "tables",
+        "predicates",
+        "children",
+    }
+    assert set(result["tree"]["predicates"][0]) == {
+        "left",
+        "right",
+        "selectivity",
+    }
+
+
+def test_alternative_accepts_empty_list_without_predicates():
+    payload = {
+        "tables": [{"name": "A", "rows": 1}, {"name": "B", "rows": 1}],
+        "predicates": [],
+        "alternative_selectivities": [],
+    }
+    result = solve(payload)
+    assert result["status"] == "disconnected"
+    assert all(c["alternative_cost"] == "0/1" for c in result["components"])
+
+
+def test_alternative_alias_is_accepted():
+    payload = {
+        "tables": [{"name": "A", "rows": 10}, {"name": "B", "rows": 20}],
+        "predicates": [{"left": "A", "right": "B", "selectivity": "1/2"}],
+        "alt_selectivities": ["1/5"],
+    }
+    result = solve(payload)
+    assert result["cost"] == "100/1"
+    assert result["alternative_cost"] == "40/1"
 
 
 # ---------------------------------------------------------------------------
@@ -598,6 +959,29 @@ def test_cli_file_argument(tmp_path):
     proc = run_cli(args=[str(path)])
     assert proc.returncode == 0
     assert json.loads(proc.stdout)["cost"] == "12/1"
+
+
+def test_cli_two_distribution_roundtrip():
+    payload = {
+        "tables": [{"name": "A", "rows": 100}, {"name": "B", "rows": 200}],
+        "predicates": [{"left": "A", "right": "B", "selectivity": "1/10"}],
+        "alternative_selectivities": ["1/20"],
+    }
+    proc = run_cli(stdin=json.dumps(payload))
+    assert proc.returncode == 0
+    assert json.loads(proc.stdout) == solve(payload)
+
+
+def test_cli_invalid_alternative_fraction_outputs_only_error():
+    payload = {
+        "tables": [{"name": "A", "rows": 100}, {"name": "B", "rows": 200}],
+        "predicates": [{"left": "A", "right": "B", "selectivity": "1/10"}],
+        "alternative_selectivities": ["1/0"],
+    }
+    proc = run_cli(stdin=json.dumps(payload))
+    assert proc.returncode == 2
+    body = json.loads(proc.stdout)
+    assert body == {"status": "error", "error": "selectivity '1/0' has a zero denominator"}
 
 
 def test_cli_invalid_json():

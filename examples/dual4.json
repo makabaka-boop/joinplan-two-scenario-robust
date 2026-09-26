@@ -1,0 +1,14 @@
+{
+  "tables": [
+    {"name": "A", "rows": 1000},
+    {"name": "B", "rows": 1000},
+    {"name": "C", "rows": 1000},
+    {"name": "D", "rows": 1000}
+  ],
+  "predicates": [
+    {"left": "A", "right": "B", "selectivity": "1/100"},
+    {"left": "B", "right": "C", "selectivity": "1/50"},
+    {"left": "C", "right": "D", "selectivity": "1/4"}
+  ],
+  "alternative_selectivities": ["1/2", "1/100", "1/100"]
+}

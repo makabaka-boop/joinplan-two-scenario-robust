@@ -14,12 +14,16 @@ Input
   ],
   "predicates": [                            # optional, default []
     {"left": "A", "right": "B", "selectivity": "1/10"}, ...
-  ]                                          # several predicates per table
+  ],                                         # several predicates per table
                                              # pair are allowed
+  "alternative_selectivities": ["1/20", ...] # optional; one value per predicate
 }
 
 A selectivity is a rational in [0, 1] given as "p/q" (or the integer 0 / 1).
-Non-reduced fractions such as "2/4" are accepted and reduced internally.
+Non-reduced fractions such as "2/4" are accepted and reduced internally.  The
+optional "alternative_selectivities" array, if present, must contain one such
+rational for each predicate and limits the instance to 2..6 tables.  It does
+not change the predicate graph; it supplies a second data distribution.
 
 Model
 -----
@@ -27,18 +31,26 @@ Any binary join tree is allowed, but every merge must have at least one
 predicate between its two sides.  The estimated row count of a subtree is the
 product of its base-table row counts times the selectivities of *all*
 predicates inside the subtree; the total cost of a tree is the sum of the
-estimated row counts of its non-leaf nodes.  Among all minimum-cost trees the
-one with the lexicographically smallest fully-parenthesized tree string wins,
-where every internal node keeps its left/right children ordered by tree-string
-byte order.
+estimated row counts of its non-leaf nodes.  With one distribution, the
+minimum-cost tree is chosen.  With two distributions every tree gets an exact
+rational row estimate and cost under each distribution, and the objective is
+lexicographically (max(cost_1, cost_2), cost_1 + cost_2, tree_string).  At each
+subset the planner keeps every non-dominated (cost_1, cost_2) pair, not merely
+a per-distribution winner.  Among tied trees the one with the lexicographically
+smallest fully-parenthesized tree string wins, where every internal node keeps
+its left/right children ordered by tree-string byte order.
 
 Output
 ------
 Connected predicate graph:
   {"status": "ok", "cost": "p/q", "tree_string": "((AB)C)", "tree": {...}}
+With alternative_selectivities, also "alternative_cost": "p/q" at the root and
+"alternative_rows": "p/q" on each join node; each predicate shows its second
+selectivity as "alternative_selectivity".
 Disconnected graph:
   {"status": "disconnected", "components": [{"tables": [...], "cost": "p/q",
-     "tree_string": "...", "tree": {...}}, ...]}
+     "alternative_cost": "p/q" (when supplied), "tree_string": "...",
+     "tree": {...}}, ...]}
 Invalid input (exit code 2):
   {"status": "error", "error": "..."}
 
@@ -56,6 +68,18 @@ from fractions import Fraction
 
 MIN_TABLES = 2
 MAX_TABLES = 9
+MAX_TABLES_WITH_ALTERNATIVE = 6
+ALTERNATIVE_SELECTIVITIES_KEY = "alternative_selectivities"
+_ALTERNATIVE_KEYS = (
+    ALTERNATIVE_SELECTIVITIES_KEY,
+    "alternative_predicate_selectivities",
+    "alt_selectivities",
+    "secondary_selectivities",
+    "second_selectivities",
+    "selectivities2",
+    "selectivities_2",
+    "selectivities_alt",
+)
 
 _SELECTIVITY_RE = re.compile(r"([0-9]+)(?:/([0-9]+))?")
 
@@ -112,26 +136,37 @@ def _parse_selectivity(value):
 
 
 def parse_problem(data):
-    """Validate the raw JSON document.
+    """Validate the raw JSON document and return a four-tuple.
 
-    Returns (names, rows, predicates) where names is a list of table names in
-    input order, rows maps name -> positive int, and predicates is a list of
-    (left, right, Fraction) in input order.
+    Returns (names, rows, predicates, alternative_selectivities).  Names are
+    in input order, rows maps name -> positive int, and predicates is a list
+    of (left, right, Fraction) in input order.  When the optional second
+    distribution is absent the final value is None; otherwise it is a list of
+    Fraction values aligned with the predicates by index.
     """
     if not isinstance(data, dict):
         raise InputError("the top level must be a JSON object")
-    unknown = set(data) - {"tables", "predicates"}
+    supplied_alt_keys = [key for key in _ALTERNATIVE_KEYS if key in data]
+    unknown = set(data) - {"tables", "predicates", *_ALTERNATIVE_KEYS}
     if unknown:
         raise InputError(f"unknown top-level keys: {sorted(unknown)}")
+    if len(supplied_alt_keys) > 1:
+        raise InputError(
+            "only one second-distribution selectivity array may be supplied; "
+            f"got {sorted(supplied_alt_keys)}"
+        )
+    alt_key = supplied_alt_keys[0] if supplied_alt_keys else None
     if "tables" not in data:
         raise InputError("missing 'tables'")
 
     tables = data["tables"]
     if not isinstance(tables, list):
         raise InputError("'tables' must be a list")
-    if not MIN_TABLES <= len(tables) <= MAX_TABLES:
+    max_tables = MAX_TABLES_WITH_ALTERNATIVE if alt_key else MAX_TABLES
+    if not MIN_TABLES <= len(tables) <= max_tables:
+        scope = f" when {alt_key} is supplied" if alt_key else ""
         raise InputError(
-            f"need between {MIN_TABLES} and {MAX_TABLES} tables, "
+            f"need between {MIN_TABLES} and {max_tables} tables{scope}, "
             f"got {len(tables)}"
         )
 
@@ -170,7 +205,21 @@ def parse_problem(data):
             raise InputError(f"predicate on {left!r} must join two distinct tables")
         predicates.append((left, right, _parse_selectivity(entry["selectivity"])))
 
-    return names, rows, predicates
+    alternative = None
+    if alt_key is not None:
+        raw_alternative = data[alt_key]
+        if not isinstance(raw_alternative, list):
+            raise InputError(f"{alt_key!r} must be a list")
+        if len(raw_alternative) != len(predicates):
+            raise InputError(
+                f"{alt_key!r} must contain one selectivity for every predicate: "
+                f"expected {len(predicates)}, got {len(raw_alternative)}"
+            )
+        alternative = [
+            _parse_selectivity(value) for value in raw_alternative
+        ]
+
+    return names, rows, predicates, alternative
 
 
 # ---------------------------------------------------------------------------
@@ -335,6 +384,190 @@ class _ComponentPlanner:
         }
 
 
+class _TwoScenarioComponentPlanner:
+    """Exact Pareto subset DP for two selectivity distributions.
+
+    plans[mask] maps a non-dominated total-cost pair
+    ``(primary_cost, alternative_cost)`` to a dict of canonical tree strings.
+    Each string's witness is ``(submask, left_string, right_string)``; leaves
+    use a single ``{name: None}`` entry.
+
+    Keeping every non-dominated pair is necessary because a subtree that is not
+    cheapest under either distribution can still be part of the globally best
+    compromise after its external joins add rows in both scenarios.
+    """
+
+    def __init__(self, names, rows, predicates, alternative):
+        self.names = list(names)
+        self.n = len(self.names)
+        index = {name: i for i, name in enumerate(self.names)}
+        self.rows = [rows[name] for name in self.names]
+
+        primary_sel = [[Fraction(1)] * self.n for _ in range(self.n)]
+        alternative_sel = [[Fraction(1)] * self.n for _ in range(self.n)]
+        adjacency = [0] * self.n
+        self.predicates = []
+        for primary_predicate, alt_sel in zip(predicates, alternative):
+            left, right, primary = primary_predicate
+            i, j = index[left], index[right]
+            primary_sel[i][j] *= primary
+            primary_sel[j][i] *= primary
+            alternative_sel[i][j] *= alt_sel
+            alternative_sel[j][i] *= alt_sel
+            adjacency[i] |= 1 << j
+            adjacency[j] |= 1 << i
+            self.predicates.append(
+                (1 << i, 1 << j, left, right, primary, alt_sel)
+            )
+
+        size = 1 << self.n
+        adjmask = [0] * size
+        primary_rows = [Fraction(0)] * size
+        alternative_rows = [Fraction(0)] * size
+        self.mask_tables = [None] * size
+        for mask in range(1, size):
+            low = mask & (-mask)
+            i = low.bit_length() - 1
+            rest = mask ^ low
+            adjmask[mask] = adjmask[rest] | adjacency[i]
+            primary_estimate = Fraction(self.rows[i])
+            alternative_estimate = Fraction(self.rows[i])
+            bits = rest
+            while bits:
+                bit = bits & (-bits)
+                j = bit.bit_length() - 1
+                primary_estimate *= primary_sel[i][j]
+                alternative_estimate *= alternative_sel[i][j]
+                bits ^= bit
+            if rest:
+                primary_estimate *= primary_rows[rest]
+                alternative_estimate *= alternative_rows[rest]
+            primary_rows[mask] = primary_estimate
+            alternative_rows[mask] = alternative_estimate
+            self.mask_tables[mask] = sorted(
+                self.mask_tables[rest] + [self.names[i]] if rest else [self.names[i]]
+            )
+        self.adjmask = adjmask
+        self.rows_est = primary_rows
+        self.alternative_rows_est = alternative_rows
+
+        self.plans = [None] * size
+        for mask in range(1, size):
+            if mask & (mask - 1) == 0:
+                i = (mask & (-mask)).bit_length() - 1
+                self.plans[mask] = {(Fraction(0), Fraction(0)): {self.names[i]: None}}
+            else:
+                self._combine(mask)
+
+    @staticmethod
+    def _prune(candidates):
+        pairs = list(candidates)
+        kept = {}
+        for pair in pairs:
+            dominated = False
+            for other in pairs:
+                if pair == other:
+                    continue
+                if other[0] <= pair[0] and other[1] <= pair[1]:
+                    dominated = True
+                    break
+            if not dominated:
+                kept[pair] = candidates[pair]
+        return kept
+
+    def _combine(self, mask):
+        low = mask & (-mask)
+        candidates = {}
+        root_rows = (self.rows_est[mask], self.alternative_rows_est[mask])
+
+        # Enumerate each unordered split sub | other exactly once by forcing
+        # the lowest table of mask into sub.
+        sub = (mask - 1) & mask
+        while sub:
+            other = mask ^ sub
+            if sub & low and self.adjmask[sub] & other:
+                left_plans = self.plans[sub]
+                right_plans = self.plans[other]
+                if left_plans is not None and right_plans is not None:
+                    for left_pair, left_strings in left_plans.items():
+                        for right_pair, right_strings in right_plans.items():
+                            pair = (
+                                left_pair[0] + right_pair[0] + root_rows[0],
+                                left_pair[1] + right_pair[1] + root_rows[1],
+                            )
+                            strings = candidates.setdefault(pair, {})
+                            for left_string in left_strings:
+                                for right_string in right_strings:
+                                    fused = _fuse(left_string, right_string)
+                                    strings.setdefault(
+                                        fused,
+                                        (sub, left_string, right_string),
+                                    )
+            sub = (sub - 1) & mask
+        self.plans[mask] = self._prune(candidates) if candidates else {}
+
+    def best(self, mask):
+        def item_key(item):
+            pair = item[0]
+            string = item[1]
+            return (max(pair), pair[0] + pair[1], string)
+
+        choices = [
+            (pair, string)
+            for pair, strings in self.plans[mask].items()
+            for string in strings
+        ]
+        return min(choices, key=item_key)
+
+    def best_string(self, mask):
+        return self.best(mask)[1]
+
+    def build(self, mask, tree_string):
+        """Materialize the chosen tree as nested JSON-able dicts."""
+        pair = next(
+            candidate
+            for candidate, strings in self.plans[mask].items()
+            if tree_string in strings
+        )
+        witness = self.plans[mask][pair][tree_string]
+        if witness is None:
+            i = (mask & (-mask)).bit_length() - 1
+            return {"type": "table", "name": self.names[i], "rows": self.rows[i]}
+
+        sub, left_string, right_string = witness
+        other = mask ^ sub
+        child_sub = self.build(sub, left_string)
+        child_other = self.build(other, right_string)
+        children = (
+            [child_sub, child_other]
+            if left_string <= right_string
+            else [child_other, child_sub]
+        )
+        effective = []
+        for left_bit, right_bit, left, right, primary, alt_sel in self.predicates:
+            # First effective here: both endpoints are in this subtree and the
+            # current merge separates them.
+            if (left_bit & mask) and (right_bit & mask) and (
+                bool(left_bit & sub) != bool(right_bit & sub)
+            ):
+                effective.append(
+                    {
+                        "left": left,
+                        "right": right,
+                        "selectivity": format_fraction(primary),
+                        "alternative_selectivity": format_fraction(alt_sel),
+                    }
+                )
+        return {
+            "type": "join",
+            "rows": format_fraction(self.rows_est[mask]),
+            "alternative_rows": format_fraction(self.alternative_rows_est[mask]),
+            "tables": self.mask_tables[mask],
+            "predicates": effective,
+            "children": children,
+        }
+
+
 def _components(names, predicates):
     adjacency = {name: set() for name in names}
     for left, right, _ in predicates:
@@ -360,51 +593,80 @@ def _components(names, predicates):
     return result
 
 
-def _plan_component(tables, rows, predicates):
-    """Plan one connected component; returns (cost, tree_string, tree)."""
+def _plan_component(tables, rows, predicates, alternative=None):
+    """Plan one connected component.
+
+    Returns (primary_cost, alternative_cost_or_None, tree_string, tree).
+    """
     if len(tables) == 1:
         name = tables[0]
-        return Fraction(0), name, {"type": "table", "name": name, "rows": rows[name]}
-    planner = _ComponentPlanner(tables, rows, predicates)
+        leaf = {"type": "table", "name": name, "rows": rows[name]}
+        return Fraction(0), (Fraction(0) if alternative is not None else None), name, leaf
+    if alternative is None:
+        planner = _ComponentPlanner(tables, rows, predicates)
+        full = (1 << len(tables)) - 1
+        cost = planner.cost[full]
+        if cost is None:  # pragma: no cover - connected components join
+            raise AssertionError("connected component has no legal join tree")
+        tree_string = planner.best_string(full)
+        return cost, None, tree_string, planner.build(full, tree_string)
+
+    planner = _TwoScenarioComponentPlanner(tables, rows, predicates, alternative)
     full = (1 << len(tables)) - 1
-    cost = planner.cost[full]
-    if cost is None:  # pragma: no cover - a connected component is always joinable
+    if not planner.plans[full]:  # pragma: no cover - connected components join
         raise AssertionError("connected component has no legal join tree")
-    tree_string = planner.best_string(full)
-    return cost, tree_string, planner.build(full, tree_string)
+    cost_pair, tree_string = planner.best(full)
+    return (
+        cost_pair[0],
+        cost_pair[1],
+        tree_string,
+        planner.build(full, tree_string),
+    )
 
 
-def plan(names, rows, predicates):
+def plan(names, rows, predicates, alternative=None):
     """Produce the plan JSON structure for an already-validated problem."""
     components = _components(names, predicates)
     planned = []
     for tables in components:
         members = set(tables)
-        local = [p for p in predicates if p[0] in members]
-        cost, tree_string, tree = _plan_component(tables, rows, local)
-        planned.append(
-            {
-                "tables": tables,
-                "cost": format_fraction(cost),
-                "tree_string": tree_string,
-                "tree": tree,
-            }
+        local_indexes = [
+            i
+            for i, (left, _right, _sel) in enumerate(predicates)
+            if left in members
+        ]
+        local = [predicates[i] for i in local_indexes]
+        local_alt = (
+            [alternative[i] for i in local_indexes] if alternative is not None else None
         )
+        cost, alt_cost, tree_string, tree = _plan_component(
+            tables, rows, local, local_alt
+        )
+        component = {
+            "tables": tables,
+            "cost": format_fraction(cost),
+        }
+        if alt_cost is not None:
+            component["alternative_cost"] = format_fraction(alt_cost)
+        component.update({"tree_string": tree_string, "tree": tree})
+        planned.append(component)
     if len(planned) == 1:
         only = planned[0]
-        return {
+        result = {
             "status": "ok",
             "cost": only["cost"],
-            "tree_string": only["tree_string"],
-            "tree": only["tree"],
         }
+        if "alternative_cost" in only:
+            result["alternative_cost"] = only["alternative_cost"]
+        result.update({"tree_string": only["tree_string"], "tree": only["tree"]})
+        return result
     return {"status": "disconnected", "components": planned}
 
 
 def plan_problem(data):
     """Validate a raw JSON document and plan it."""
-    names, rows, predicates = parse_problem(data)
-    return plan(names, rows, predicates)
+    names, rows, predicates, alternative = parse_problem(data)
+    return plan(names, rows, predicates, alternative)
 
 
 # ---------------------------------------------------------------------------
